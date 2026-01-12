@@ -1,0 +1,16 @@
+# --- 모델 및 데이터 제외 ---
+pretrained_models/
+checkpoints/
+outputs/
+
+# --- 시스템 및 환경 설정 제외 ---
+__pycache__/
+*.pyc
+.DS_Store
+.venv
+venv/
+.env
+
+# --- IDE 설정 제외 (사용 중이라면) ---
+.vscode/
+.idea/
