@@ -14,7 +14,6 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 # Dataset의 매핑을 역으로 이용하여 MIDI 생성 시 사용
-# 7채널 인덱스 -> 대표 MIDI 노트 번호
 REVERSE_DRUM_MAPPING = {
     0: 36,  # Kick
     1: 38,  # Snare
