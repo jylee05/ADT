@@ -28,14 +28,13 @@ def main():
     print("Initializing Model...")
     backbone = FlowMatchingTransformer(cfg).to(device)
     
-    # Multi-GPU Check
+    # Multi-GPU Check (DataParallel 적용)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         backbone = nn.DataParallel(backbone)
     
     # Loss Wrapper
-    # DataParallel 사용 시 backbone.module에 접근해야 할 수도 있으나, 
-    # forward 호출은 자동 분배되므로 wrapper에 그대로 넘김
+    # backbone이 DataParallel로 감싸져 있어도 forward는 정상 작동합니다.
     loss_wrapper = AnnealedPseudoHuberLoss(backbone, cfg).to(device)
     
     optimizer = torch.optim.AdamW(backbone.parameters(), lr=cfg.LR)
@@ -78,7 +77,7 @@ def main():
             os.makedirs("checkpoints", exist_ok=True)
             save_path = f"checkpoints/n2n_ep{epoch+1}.pth"
             
-            # Unwrap DataParallel if present
+            # [중요] DataParallel 포장지 벗기고 저장
             if isinstance(backbone, nn.DataParallel):
                 state_dict = backbone.module.state_dict()
             else:

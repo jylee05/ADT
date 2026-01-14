@@ -48,10 +48,12 @@ class Config:
     # ==============================
     # 5. 학습 하이퍼파라미터
     # ==============================
-    BATCH_SIZE = 16        # 메모리 부족 시 8로 조절
+    # [수정] OOM 방지를 위해 16으로 설정 (GPU 2개 사용 시 개당 8개 처리)
+    BATCH_SIZE = 16        
+    
     LR = 3e-4
     EPOCHS = 100
-    NUM_WORKERS = 4
+    NUM_WORKERS = 8        # 데이터 로딩 속도 향상
     DEVICE = "cuda"
     
     # Loss Annealing (MSE -> MAE)
