@@ -241,7 +241,18 @@ class FlowMatchingTransformer(nn.Module):
 
         return out_feat
 
-    def forward(self, x_t, t, mert_feats, spec_feats):
+    def forward(self, x_t, t, audio_mert, spec_feats):
+        """
+        Args:
+            x_t: Noisy drum grid (B, T, D)
+            t: Time step (B,)
+            audio_mert: Raw audio for MERT (B, samples) - MERT 추출을 내부에서 수행!
+            spec_feats: Mel-spectrogram features (B, T, N_MELS)
+        """
+        # 0. MERT Feature Extraction (forward 내부에서 수행하여 DataParallel 병렬화!)
+        # 이렇게 해야 DataParallel이 audio_mert를 GPU별로 분할하여 병렬 처리함
+        mert_feats = self.extract_mert(audio_mert)
+        
         # 1. Condition Dropout & Substitution
         mert_h = self.apply_condition_dropout(
             mert_feats, self.null_mert_emb, 
@@ -252,7 +263,7 @@ class FlowMatchingTransformer(nn.Module):
             self.config.DROP_SPEC_PROB, self.config.DROP_PARTIAL_PROB
         )
         
-        # [수정] 2. MERT를 Spec 길이에 맞게 Interpolate (Encoder 전에!)
+        # 2. MERT를 Spec 길이에 맞게 Interpolate (Encoder 전에!)
         # 시간 정렬을 먼저 해야 positional encoding과 encoder가 
         # 동일한 시간 해상도에서 동작함
         target_len = spec_h.shape[1]  # Spec의 시간 길이 기준
@@ -312,26 +323,23 @@ class AnnealedPseudoHuberLoss(nn.Module):
     def sample_time(self, batch_size, device):
         """
         Flow Matching Time Sampling
-        - 논문에서는 보통 uniform 또는 logit-normal 분포 사용
-        - 여기서는 약간의 bias를 주어 t=0, t=1 근처도 잘 학습하도록 함
+        학습 안정성을 위해 [eps, 1-eps] 범위로 클리핑
         """
-        # [개선] Beta distribution으로 중간값과 끝값 모두 잘 샘플링
-        # Beta(2, 2)는 중간에 살짝 집중, Beta(1, 1)은 uniform
-        # 학습 안정성을 위해 [eps, 1-eps] 범위로 클리핑
         eps = 1e-4
         t = torch.rand(batch_size, device=device)
         t = t * (1 - 2 * eps) + eps  # [eps, 1-eps]
         return t
 
     def forward(self, audio_mert, spec, target_score, progress):
+        """
+        Args:
+            audio_mert: Raw audio for MERT (B, samples)
+            spec: Mel-spectrogram (B, T, N_MELS)
+            target_score: Ground truth drum grid (B, T, D)
+            progress: Training progress [0, 1]
+        """
         device = audio_mert.device
         batch_size = audio_mert.size(0)
-        
-        # [수정] DataParallel 사용 시 .module로 접근
-        if isinstance(self.model, nn.DataParallel):
-            mert_feats = self.model.module.extract_mert(audio_mert)
-        else:
-            mert_feats = self.model.extract_mert(audio_mert)
         
         # Flow Matching Setup
         t = self.sample_time(batch_size, device)
@@ -343,8 +351,10 @@ class AnnealedPseudoHuberLoss(nn.Module):
         t_view = t.view(batch_size, 1, 1)
         x_t = (1 - t_view) * x_0 + t_view * x_1
         
-        # Velocity Prediction (Forward는 DataParallel이 알아서 분배)
-        pred_v = self.model(x_t, t, mert_feats, spec)
+        # [핵심 수정] Velocity Prediction
+        # audio_mert를 직접 넘겨서 DataParallel이 자동으로 GPU별 분할 처리
+        # MERT 추출은 model.forward() 내부에서 수행됨
+        pred_v = self.model(x_t, t, audio_mert, spec)
         
         # Target velocity: v = dx/dt = x_1 - x_0 (constant for linear path)
         target_v = x_1 - x_0 
@@ -357,16 +367,15 @@ class AnnealedPseudoHuberLoss(nn.Module):
 
     @torch.no_grad()
     def sample(self, audio_mert, spec, steps=10, init_score=None, start_t=0.0):
+        """Inference용 샘플링 (단일 GPU 가정)"""
         self.model.eval()
         device = audio_mert.device
         batch_size = audio_mert.size(0)
         
-        # [수정] 여기도 동일하게 .module 체크
+        # Inference 시에는 모델 내부에서 MERT 추출하므로 input_dim만 가져옴
         if isinstance(self.model, nn.DataParallel):
-            mert_feats = self.model.module.extract_mert(audio_mert)
             input_dim = self.model.module.input_dim
         else:
-            mert_feats = self.model.extract_mert(audio_mert)
             input_dim = self.model.input_dim
 
         seq_len = spec.size(1) 
@@ -388,7 +397,8 @@ class AnnealedPseudoHuberLoss(nn.Module):
             t_val = t_current + i * dt
             t_tensor = torch.full((batch_size,), t_val, device=device)
             
-            v_pred = self.model(x_t, t_tensor, mert_feats, spec)
+            # audio_mert를 직접 전달
+            v_pred = self.model(x_t, t_tensor, audio_mert, spec)
             x_t = x_t + v_pred * dt
             
         return x_t

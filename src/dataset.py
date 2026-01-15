@@ -44,6 +44,14 @@ class EGMDDataset(Dataset):
         )
         self.db_transform = torchaudio.transforms.AmplitudeToDB()
         
+        # [최적화] Resampler를 미리 생성 (CPU 병목 방지)
+        # E-GMD 데이터셋은 44.1kHz이므로, 해당 SR에서의 resampler만 생성
+        self.resampler_to_mert = torchaudio.transforms.Resample(
+            self.config.AUDIO_SR, self.config.MERT_SR
+        )
+        # 혹시 다른 SR의 파일이 있을 경우를 위한 캐시
+        self._resampler_cache = {}
+        
         # 데이터 검색
         print(f"Scanning data from {self.config.DATA_ROOT}...")
         search_path = os.path.join(self.config.DATA_ROOT, "drummer*")
@@ -61,6 +69,13 @@ class EGMDDataset(Dataset):
                     self.files.append((aud_path, mid_path))
         
         print(f"Found {len(self.files)} pairs.")
+    
+    def _get_resampler(self, orig_sr, target_sr):
+        """Resampler 캐싱으로 반복 생성 방지"""
+        key = (orig_sr, target_sr)
+        if key not in self._resampler_cache:
+            self._resampler_cache[key] = torchaudio.transforms.Resample(orig_sr, target_sr)
+        return self._resampler_cache[key]
 
     def __len__(self):
         return len(self.files)
@@ -100,16 +115,19 @@ class EGMDDataset(Dataset):
         # 1. Load Audio
         wav, sr = torchaudio.load(aud_path)
         
-        # 2. Resample for Spectrogram (44.1k)
+        # 2. Resample for Spectrogram (44.1k) - 캐싱된 resampler 사용
         if sr != self.config.AUDIO_SR:
-            resampler = torchaudio.transforms.Resample(sr, self.config.AUDIO_SR)
+            resampler = self._get_resampler(sr, self.config.AUDIO_SR)
             wav_spec_in = resampler(wav)
         else:
             wav_spec_in = wav
 
-        # 3. Resample for MERT (24k)
-        if sr != self.config.MERT_SR:
-            resampler_mert = torchaudio.transforms.Resample(sr, self.config.MERT_SR)
+        # 3. Resample for MERT (24k) - 캐싱된 resampler 사용
+        if sr == self.config.AUDIO_SR:
+            # 가장 일반적인 케이스: 44.1k -> 24k (미리 생성된 resampler 사용)
+            wav_mert_in = self.resampler_to_mert(wav)
+        elif sr != self.config.MERT_SR:
+            resampler_mert = self._get_resampler(sr, self.config.MERT_SR)
             wav_mert_in = resampler_mert(wav)
         else:
             wav_mert_in = wav

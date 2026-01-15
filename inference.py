@@ -50,6 +50,7 @@ class ADTInference:
         self.db_transform = AmplitudeToDB().to(self.device)
 
     def get_features(self, waveform_segment, sr):
+        """오디오에서 Mel-Spectrogram과 MERT용 waveform 준비"""
         # 1. Mel-Spectrogram
         if sr != self.config.AUDIO_SR:
             resampler = torchaudio.transforms.Resample(sr, self.config.AUDIO_SR).to(self.device)
@@ -61,7 +62,7 @@ class ADTInference:
         melspec = self.db_transform(melspec)
         melspec = melspec.transpose(1, 2) # (B, T, n_mels)
 
-        # 2. MERT Feature
+        # 2. MERT용 Waveform (MERT 추출은 model.forward() 내부에서 수행)
         target_mert_sr = self.config.MERT_SR
         if sr != target_mert_sr:
             resampler_mert = torchaudio.transforms.Resample(sr, target_mert_sr).to(self.device)
@@ -69,21 +70,20 @@ class ADTInference:
         else:
             waveform_mert = waveform_segment.to(self.device)
 
-        mert_feat = self.model.extract_mert(waveform_mert)
-        # mert_feat shape: (B, T_mert, D_mert)
-        
-        # [참고] MERT feature의 interpolation은 model.forward() 내부에서 처리됨
-
-        return mert_feat, melspec
+        # waveform_mert는 (B, samples) 형태로 반환
+        # MERT feature 추출은 model.forward() 내부에서 처리됨
+        return waveform_mert, melspec
 
     @torch.no_grad()
-    def solve_euler(self, x, mert_feat, spec_feat, t_start=0.0, t_end=1.0, steps=50):
+    def solve_euler(self, x, audio_mert, spec_feat, t_start=0.0, t_end=1.0, steps=50):
+        """Euler ODE Solver for Flow Matching"""
         dt = (t_end - t_start) / steps
         times = torch.linspace(t_start, t_end, steps + 1).to(self.device)
         
         for i in range(steps):
             t_curr = torch.ones(x.shape[0], device=self.device) * times[i]
-            v_pred = self.model(x, t_curr, mert_feat, spec_feat)
+            # [수정] audio_mert를 직접 전달 (model 내부에서 MERT 추출)
+            v_pred = self.model(x, t_curr, audio_mert, spec_feat)
             x = x + v_pred * dt
         return x
 
@@ -122,21 +122,22 @@ class ADTInference:
             if original_len < chunk_samples:
                 wav_chunk = torch.nn.functional.pad(wav_chunk, (0, chunk_samples - original_len))
             
-            mert_feat, spec_feat = self.get_features(wav_chunk, sr)
+            # [수정] audio_mert를 직접 전달 (model 내부에서 MERT 추출)
+            audio_mert, spec_feat = self.get_features(wav_chunk, sr)
             
             # [수정] Output Dimension 계산 - spec_feat의 시간 길이를 사용
             out_dim = self.config.DRUM_CHANNELS * self.config.FEATURE_DIM 
             seq_len = spec_feat.shape[1]  # Spectrogram의 시간 길이
             x_0 = torch.randn(spec_feat.shape[0], seq_len, out_dim).to(self.device)
             
-            generated = self.solve_euler(x_0, mert_feat, spec_feat, steps=self.args.steps)
+            generated = self.solve_euler(x_0, audio_mert, spec_feat, steps=self.args.steps)
             
             if self.args.refine_step > 0:
                 t_refine = 1.0 - self.args.refine_strength
                 noise = torch.randn_like(generated)
                 x_refine = (1 - t_refine) * noise + t_refine * generated
                 refine_steps = int(self.args.steps * self.args.refine_strength)
-                generated = self.solve_euler(x_refine, mert_feat, spec_feat, t_start=t_refine, t_end=1.0, steps=refine_steps)
+                generated = self.solve_euler(x_refine, audio_mert, spec_feat, t_start=t_refine, t_end=1.0, steps=refine_steps)
 
             gen_np = generated[0].cpu().numpy()
             
