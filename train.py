@@ -1,83 +1,95 @@
 # train.py
+import os
+# [중요] 0번, 1번 GPU만 보이게 설정 (코드 최상단 위치)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+
 from src.config import Config
 from src.model import FlowMatchingTransformer, AnnealedPseudoHuberLoss
 from src.dataset import EGMDDataset
 from src.utils import seed_everything
 from tqdm import tqdm
-import os
 
 def main():
     seed_everything(42)
     cfg = Config()
     device = torch.device(cfg.DEVICE)
     
-    # 1. Dataset & Loader
     print("Initializing Dataset...")
     dataset = EGMDDataset(is_train=True)
     dataloader = DataLoader(
         dataset, 
         batch_size=cfg.BATCH_SIZE, 
         shuffle=True, 
-        num_workers=cfg.NUM_WORKERS
+        num_workers=cfg.NUM_WORKERS,
+        pin_memory=True
     )
     
-    # 2. Model Initialization
     print("Initializing Model...")
     backbone = FlowMatchingTransformer(cfg).to(device)
     
-    # Multi-GPU Check (DataParallel 적용)
+    # [설정] GPU 2개 모두 사용
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         backbone = nn.DataParallel(backbone)
     
-    # Loss Wrapper
-    # backbone이 DataParallel로 감싸져 있어도 forward는 정상 작동합니다.
+    # 수정된 Loss Wrapper 사용
     loss_wrapper = AnnealedPseudoHuberLoss(backbone, cfg).to(device)
     
     optimizer = torch.optim.AdamW(backbone.parameters(), lr=cfg.LR)
+    scaler = GradScaler()
     
-    # 3. Training Loop
     print(f"Start Training for {cfg.EPOCHS} epochs...")
     global_step = 0
     total_steps = cfg.EPOCHS * len(dataloader)
     
+    optimizer.zero_grad()
+    
     for epoch in range(cfg.EPOCHS):
         backbone.train()
         total_loss = 0
+        current_loss_accum = 0
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.EPOCHS}")
-        for audio_mert, spec, target in pbar:
+        for step, (audio_mert, spec, target) in enumerate(pbar):
             audio_mert = audio_mert.to(device)
             spec = spec.to(device)
             target = target.to(device)
             
-            # Annealing Progress (0.0 -> 1.0)
             progress = global_step / total_steps
             
-            # Loss Calculation
-            loss = loss_wrapper(audio_mert, spec, target, progress)
+            # Mixed Precision Training
+            with autocast():
+                loss = loss_wrapper(audio_mert, spec, target, progress)
+                loss = loss / cfg.GRAD_ACCUM_STEPS
             
-            # Backprop
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            current_loss_accum += loss.item()
             
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'prog': f"{progress:.2f}"})
+            if (step + 1) % cfg.GRAD_ACCUM_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                
+                # Logging (Restore original scale)
+                pbar.set_postfix({'loss': current_loss_accum * cfg.GRAD_ACCUM_STEPS, 'prog': f"{progress:.2f}"})
+                total_loss += current_loss_accum * cfg.GRAD_ACCUM_STEPS
+                current_loss_accum = 0
+            
             global_step += 1
             
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / (len(dataloader) / cfg.GRAD_ACCUM_STEPS)
         print(f"Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
         
-        # Checkpoint Save
         if (epoch + 1) % 10 == 0:
             os.makedirs("checkpoints", exist_ok=True)
             save_path = f"checkpoints/n2n_ep{epoch+1}.pth"
             
-            # [중요] DataParallel 포장지 벗기고 저장
+            # Unwrap DataParallel
             if isinstance(backbone, nn.DataParallel):
                 state_dict = backbone.module.state_dict()
             else:

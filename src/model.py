@@ -254,7 +254,6 @@ class AnnealedPseudoHuberLoss(nn.Module):
         self.config = config
 
     def get_c(self, progress):
-        """학습 진행도에 따라 Loss 파라미터 c 조절 (MSE -> MAE)"""
         alpha = progress
         return (1 - alpha) * self.config.C_MAX + alpha * self.config.C_MIN
 
@@ -262,64 +261,60 @@ class AnnealedPseudoHuberLoss(nn.Module):
         device = audio_mert.device
         batch_size = audio_mert.size(0)
         
-        # 특징 추출
-        mert_feats = self.model.extract_mert(audio_mert)
+        # [수정] DataParallel 사용 시 .module로 접근
+        if isinstance(self.model, nn.DataParallel):
+            mert_feats = self.model.module.extract_mert(audio_mert)
+        else:
+            mert_feats = self.model.extract_mert(audio_mert)
         
         # Flow Matching Setup
-        # t ~ Uniform[0, 1]
         t = torch.rand(batch_size, device=device)
         
-        x_1 = target_score        # Target (Clean Data)
-        x_0 = torch.randn_like(x_1) # Source (Noise)
+        x_1 = target_score        
+        x_0 = torch.randn_like(x_1) 
         
         t_view = t.view(batch_size, 1, 1)
-        # Interpolation (Straight Path)
         x_t = t_view * x_1 + (1 - t_view) * x_0
         
-        # Velocity Prediction
+        # Velocity Prediction (Forward는 DataParallel이 알아서 분배)
         pred_v = self.model(x_t, t, mert_feats, spec)
-        target_v = x_1 - x_0 # Flow Matching Target: Velocity
+        target_v = x_1 - x_0 
         
-        # Loss Calculation
+        # Loss
         diff = pred_v - target_v
         c = self.get_c(progress)
-        
-        # Pseudo-Huber Loss: sqrt(x^2 + c^2) - c
         loss = torch.sqrt(diff.pow(2) + c**2) - c
         return loss.mean()
 
     @torch.no_grad()
     def sample(self, audio_mert, spec, steps=10, init_score=None, start_t=0.0):
-        """
-        Flow Matching Inference
-        - start_t=0.0: 일반 생성 (Pure Noise에서 시작)
-        - start_t>0.0: Refinement (init_score에 노이즈 섞어서 시작)
-        """
         self.model.eval()
         device = audio_mert.device
         batch_size = audio_mert.size(0)
         
-        mert_feats = self.model.extract_mert(audio_mert)
+        # [수정] 여기도 동일하게 .module 체크
+        if isinstance(self.model, nn.DataParallel):
+            mert_feats = self.model.module.extract_mert(audio_mert)
+            input_dim = self.model.module.input_dim
+        else:
+            mert_feats = self.model.extract_mert(audio_mert)
+            input_dim = self.model.input_dim
+
         seq_len = spec.size(1) 
         
-        # 초기값 설정
         if init_score is not None and start_t > 0:
-            # Refinement Mode
             noise = torch.randn_like(init_score)
             x_t = start_t * init_score + (1 - start_t) * noise
             t_current = start_t
         else:
-            # Generation Mode
-            x_t = torch.randn(batch_size, seq_len, self.model.input_dim, device=device)
+            x_t = torch.randn(batch_size, seq_len, input_dim, device=device)
             t_current = 0.0
             
-        # 남은 스텝 계산
         steps_to_run = int(steps * (1.0 - t_current))
         if steps_to_run < 1: steps_to_run = 1
         
         dt = (1.0 - t_current) / steps_to_run
         
-        # Euler Integration (ODE Solver)
         for i in range(steps_to_run):
             t_val = t_current + i * dt
             t_tensor = torch.full((batch_size,), t_val, device=device)
