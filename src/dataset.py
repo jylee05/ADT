@@ -3,6 +3,7 @@ import os
 import glob
 import torch
 import torchaudio
+import torch.nn.functional as F
 import pretty_midi
 import numpy as np
 from torch.utils.data import Dataset
@@ -166,5 +167,16 @@ class EGMDDataset(Dataset):
             # Padding value is -1 (Silence)
             padding = np.ones((pad_len, self.config.DRUM_CHANNELS * 2)) * -1
             grid_crop = np.vstack([grid_crop, padding])
+        
+        # [수정] Spec과 Grid 시퀀스 길이 맞추기
+        # Spectrogram 프레임 수와 Grid 프레임 수가 일치하도록 보장
+        target_len = spec.shape[0]  # Spectrogram의 시간 길이
+        grid_tensor = torch.from_numpy(grid_crop).float()
+        
+        if grid_tensor.shape[0] != target_len:
+            # Grid를 Spectrogram 길이에 맞게 interpolate
+            grid_tensor = grid_tensor.unsqueeze(0).permute(0, 2, 1)  # (1, C, T)
+            grid_tensor = F.interpolate(grid_tensor, size=target_len, mode='nearest')
+            grid_tensor = grid_tensor.permute(0, 2, 1).squeeze(0)  # (T, C)
             
-        return wav_crop_mert[0], spec, torch.from_numpy(grid_crop).float()
+        return wav_crop_mert[0], spec, grid_tensor

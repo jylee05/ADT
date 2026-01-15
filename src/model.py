@@ -1,12 +1,13 @@
 # src/model.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import random
 from transformers import Wav2Vec2Model
 
 # -------------------------------------------------------------------
-# Positional Embedding (Time Step용)
+# Positional Embedding (Time Step용) - Diffusion/Flow Matching의 t 임베딩
 # -------------------------------------------------------------------
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -21,6 +22,33 @@ class SinusoidalPosEmb(nn.Module):
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
+
+# -------------------------------------------------------------------
+# Sequence Positional Embedding (시퀀스 위치 정보용)
+# -------------------------------------------------------------------
+class SequencePositionalEncoding(nn.Module):
+    """Transformer 시퀀스용 Sinusoidal Positional Encoding"""
+    def __init__(self, d_model, max_len=2000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Precompute positional encoding
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        """
+        x: (Batch, Seq_len, d_model)
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 # -------------------------------------------------------------------
 # FiLM (Feature-wise Linear Modulation) Layer
@@ -110,7 +138,7 @@ class FlowMatchingTransformer(nn.Module):
         # 1. Input Projection
         self.proj_in = nn.Linear(self.input_dim, config.HIDDEN_DIM)
         
-        # 2. Time Embedding MLP
+        # 2. Time Embedding MLP (Flow Matching의 t용)
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(config.HIDDEN_DIM),
             nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM),
@@ -118,8 +146,14 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM)
         )
         
-        # 3. Condition Encoders (분리형 구조)
-        # 3-1. MERT Path
+        # [추가] 3. Sequence Positional Encodings
+        # 각 시퀀스의 위치 정보를 인코딩
+        self.pos_enc_main = SequencePositionalEncoding(config.HIDDEN_DIM, max_len=2000)
+        self.pos_enc_mert = SequencePositionalEncoding(config.HIDDEN_DIM, max_len=1000)
+        self.pos_enc_spec = SequencePositionalEncoding(config.HIDDEN_DIM, max_len=1000)
+        
+        # 4. Condition Encoders (분리형 구조)
+        # 4-1. MERT Path
         self.mert_proj = nn.Linear(config.MERT_DIM, config.HIDDEN_DIM)
         self.mert_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -132,7 +166,7 @@ class FlowMatchingTransformer(nn.Module):
             num_layers=config.COND_LAYERS
         )
 
-        # 3-2. Spectrogram Path
+        # 4-2. Spectrogram Path
         self.spec_proj = nn.Linear(config.N_MELS, config.HIDDEN_DIM)
         self.spec_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -145,12 +179,12 @@ class FlowMatchingTransformer(nn.Module):
             num_layers=config.COND_LAYERS
         )
         
-        # 4. Learned Null Embeddings (학습 가능한 0 벡터)
+        # 5. Learned Null Embeddings (학습 가능한 0 벡터)
         # Dropout 시 0 대신 이 벡터를 사용함
         self.null_mert_emb = nn.Parameter(torch.randn(1, 1, config.MERT_DIM) * 0.02)
         self.null_spec_emb = nn.Parameter(torch.randn(1, 1, config.N_MELS) * 0.02)
         
-        # 5. Main Decoder Layers
+        # 6. Main Decoder Layers
         self.layers = nn.ModuleList([
             FiLMTransformerDecoderLayer(
                 d_model=config.HIDDEN_DIM, 
@@ -160,10 +194,10 @@ class FlowMatchingTransformer(nn.Module):
             for _ in range(config.N_LAYERS)
         ])
         
-        # 6. Output Head
+        # 7. Output Head
         self.head = nn.Linear(config.HIDDEN_DIM, self.input_dim)
         
-        # 7. Pretrained MERT Model Load
+        # 8. Pretrained MERT Model Load
         print(f"Loading MERT from {config.MERT_PATH}...")
         self.mert = Wav2Vec2Model.from_pretrained(config.MERT_PATH, cache_dir=config.CACHE_DIR)
         self.mert.eval()
@@ -218,24 +252,41 @@ class FlowMatchingTransformer(nn.Module):
             self.config.DROP_SPEC_PROB, self.config.DROP_PARTIAL_PROB
         )
         
-        # 2. Encode Separately (독립된 인코더 사용)
-        mert_emb = self.mert_proj(mert_h)
-        mert_emb = self.mert_encoder(mert_emb)
+        # [수정] 2. MERT를 Spec 길이에 맞게 Interpolate (Encoder 전에!)
+        # 시간 정렬을 먼저 해야 positional encoding과 encoder가 
+        # 동일한 시간 해상도에서 동작함
+        target_len = spec_h.shape[1]  # Spec의 시간 길이 기준
+        if mert_h.shape[1] != target_len:
+            # (B, T, D) -> (B, D, T) -> interpolate -> (B, D, T') -> (B, T', D)
+            mert_h = mert_h.permute(0, 2, 1)
+            mert_h = F.interpolate(mert_h, size=target_len, mode='linear', align_corners=False)
+            mert_h = mert_h.permute(0, 2, 1)
         
+        # 3. Project to hidden dim
+        mert_emb = self.mert_proj(mert_h)
         spec_emb = self.spec_proj(spec_h)
+        
+        # 4. Positional Encoding (시간 정렬 후 적용!)
+        mert_emb = self.pos_enc_mert(mert_emb)
+        spec_emb = self.pos_enc_spec(spec_emb)
+        
+        # 5. Encode Separately
+        mert_emb = self.mert_encoder(mert_emb)
         spec_emb = self.spec_encoder(spec_emb)
         
-        # 3. Concatenate (Cross Attention Memory용)
+        # 6. Concatenate (Cross Attention Memory용)
+        # 이제 mert_emb와 spec_emb가 같은 시간 길이를 가짐
         memory = torch.cat([mert_emb, spec_emb], dim=1)
         
-        # 4. Global Condition for FiLM
+        # 7. Global Condition for FiLM
         time_emb = self.time_mlp(t)
         # 오디오 전체 맥락(Average Pooling)을 Time 정보와 더함
         audio_ctx = memory.mean(dim=1)
         cond_emb = time_emb + audio_ctx
         
-        # 5. Main Network Flow
+        # 8. Main Network Flow
         h = self.proj_in(x_t)
+        h = self.pos_enc_main(h)  # 메인 시퀀스에도 Positional Encoding
         # Input에도 Time 정보 더해주기 (일반적 관행)
         h = h + time_emb.unsqueeze(1)
         
@@ -254,8 +305,23 @@ class AnnealedPseudoHuberLoss(nn.Module):
         self.config = config
 
     def get_c(self, progress):
+        """Annealing: 학습 초기에는 큰 c(MSE처럼), 후반에는 작은 c(L1처럼)"""
         alpha = progress
         return (1 - alpha) * self.config.C_MAX + alpha * self.config.C_MIN
+    
+    def sample_time(self, batch_size, device):
+        """
+        Flow Matching Time Sampling
+        - 논문에서는 보통 uniform 또는 logit-normal 분포 사용
+        - 여기서는 약간의 bias를 주어 t=0, t=1 근처도 잘 학습하도록 함
+        """
+        # [개선] Beta distribution으로 중간값과 끝값 모두 잘 샘플링
+        # Beta(2, 2)는 중간에 살짝 집중, Beta(1, 1)은 uniform
+        # 학습 안정성을 위해 [eps, 1-eps] 범위로 클리핑
+        eps = 1e-4
+        t = torch.rand(batch_size, device=device)
+        t = t * (1 - 2 * eps) + eps  # [eps, 1-eps]
+        return t
 
     def forward(self, audio_mert, spec, target_score, progress):
         device = audio_mert.device
@@ -268,19 +334,22 @@ class AnnealedPseudoHuberLoss(nn.Module):
             mert_feats = self.model.extract_mert(audio_mert)
         
         # Flow Matching Setup
-        t = torch.rand(batch_size, device=device)
+        t = self.sample_time(batch_size, device)
         
         x_1 = target_score        
         x_0 = torch.randn_like(x_1) 
         
+        # Linear interpolation: x_t = (1-t)*x_0 + t*x_1
         t_view = t.view(batch_size, 1, 1)
-        x_t = t_view * x_1 + (1 - t_view) * x_0
+        x_t = (1 - t_view) * x_0 + t_view * x_1
         
         # Velocity Prediction (Forward는 DataParallel이 알아서 분배)
         pred_v = self.model(x_t, t, mert_feats, spec)
+        
+        # Target velocity: v = dx/dt = x_1 - x_0 (constant for linear path)
         target_v = x_1 - x_0 
         
-        # Loss
+        # Annealed Pseudo-Huber Loss
         diff = pred_v - target_v
         c = self.get_c(progress)
         loss = torch.sqrt(diff.pow(2) + c**2) - c

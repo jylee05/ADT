@@ -6,13 +6,16 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler  # [수정] torch.cuda.amp deprecated
 
 from src.config import Config
 from src.model import FlowMatchingTransformer, AnnealedPseudoHuberLoss
 from src.dataset import EGMDDataset
 from src.utils import seed_everything
 from tqdm import tqdm
+
+# Gradient Clipping을 위한 max norm
+MAX_GRAD_NORM = 1.0
 
 def main():
     seed_everything(42)
@@ -40,8 +43,8 @@ def main():
     # 수정된 Loss Wrapper 사용
     loss_wrapper = AnnealedPseudoHuberLoss(backbone, cfg).to(device)
     
-    optimizer = torch.optim.AdamW(backbone.parameters(), lr=cfg.LR)
-    scaler = GradScaler()
+    optimizer = torch.optim.AdamW(backbone.parameters(), lr=cfg.LR, weight_decay=0.01)
+    scaler = GradScaler('cuda')  # PyTorch 2.x 호환
     
     print(f"Start Training for {cfg.EPOCHS} epochs...")
     global_step = 0
@@ -62,8 +65,8 @@ def main():
             
             progress = global_step / total_steps
             
-            # Mixed Precision Training
-            with autocast():
+            # [수정] Mixed Precision Training - device_type 명시
+            with autocast(device_type='cuda'):
                 loss = loss_wrapper(audio_mert, spec, target, progress)
                 loss = loss / cfg.GRAD_ACCUM_STEPS
             
@@ -71,6 +74,10 @@ def main():
             current_loss_accum += loss.item()
             
             if (step + 1) % cfg.GRAD_ACCUM_STEPS == 0:
+                # Gradient Clipping (학습 안정화)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(backbone.parameters(), MAX_GRAD_NORM)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
