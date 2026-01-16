@@ -7,6 +7,7 @@ import numpy as np
 import pretty_midi
 from scipy.signal import find_peaks
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
+from tqdm import tqdm
 
 from src.config import Config
 from src.model import FlowMatchingTransformer
@@ -21,19 +22,34 @@ class ADTInference:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = Config()
         
+        # GPU 개수 확인
+        self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        print(f"Available GPUs: {self.num_gpus}")
+        
         # 모델 로드
         self.model = FlowMatchingTransformer(self.config).to(self.device)
         self.load_checkpoint(args.ckpt_path)
+        
+        # Multi-GPU 설정 (training과 동일하게)
+        if self.num_gpus > 1:
+            print(f"Using DataParallel on {self.num_gpus} GPUs for inference")
+            self.model = torch.nn.DataParallel(self.model)
+        
         self.model.eval()
-
         self.init_feature_extractors()
 
     def load_checkpoint(self, path):
         print(f"Loading checkpoint: {path}")
         checkpoint = torch.load(path, map_location=self.device)
         state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-        # DataParallel로 저장된 경우 module. 접두어 제거
-        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        
+        # DataParallel로 저장된 경우를 위한 처리
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            # 저장된 모델이 DataParallel이었다면 module. 접두어 제거
+            new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        else:
+            new_state_dict = state_dict
+            
         self.model.load_state_dict(new_state_dict)
 
     def init_feature_extractors(self):
@@ -82,14 +98,64 @@ class ADTInference:
         # print(f"[DEBUG] waveform_mert shape: {waveform_mert.shape}, melspec shape: {melspec.shape}")
         
         return waveform_mert, melspec
+    
+    def process_batch(self, batch_chunks, sr, batch_start, total_chunks):
+        """배치 단위로 오디오 청크들을 병렬 처리"""
+        batch_audio_mert = []
+        batch_spec_feat = []
+        
+        # Feature extraction for all chunks in batch
+        for wav_chunk in batch_chunks:
+            audio_mert, spec_feat = self.get_features(wav_chunk, sr)
+            batch_audio_mert.append(audio_mert)
+            batch_spec_feat.append(spec_feat)
+        
+        # Stack batches
+        if len(batch_audio_mert) > 1:
+            batch_audio_mert = torch.cat(batch_audio_mert, dim=0)  # (batch, samples)
+            batch_spec_feat = torch.cat(batch_spec_feat, dim=0)    # (batch, T, n_mels)
+        else:
+            batch_audio_mert = batch_audio_mert[0]
+            batch_spec_feat = batch_spec_feat[0]
+            
+        # Output Dimension 계산
+        out_dim = self.config.DRUM_CHANNELS * self.config.FEATURE_DIM 
+        batch_size = batch_spec_feat.shape[0]
+        seq_len = batch_spec_feat.shape[1]  # Spectrogram의 시간 길이
+        x_0 = torch.randn(batch_size, seq_len, out_dim).to(self.device)
+        
+        # Batch generation
+        desc_start = batch_start + 1
+        desc_end = min(batch_start + len(batch_chunks), total_chunks)
+        generated = self.solve_euler(x_0, batch_audio_mert, batch_spec_feat, steps=self.args.steps,
+                                   desc=f"Batch {desc_start}-{desc_end}/{total_chunks} - Generation")
+        
+        # Refinement (if enabled)
+        if self.args.refine_step > 0:
+            t_refine = 1.0 - self.args.refine_strength
+            noise = torch.randn_like(generated)
+            x_refine = (1 - t_refine) * noise + t_refine * generated
+            refine_steps = int(self.args.steps * self.args.refine_strength)
+            generated = self.solve_euler(x_refine, batch_audio_mert, batch_spec_feat, 
+                                       t_start=t_refine, t_end=1.0, steps=refine_steps,
+                                       desc=f"Batch {desc_start}-{desc_end}/{total_chunks} - Refinement")
+        
+        # Convert to numpy and return list
+        batch_outputs = []
+        for i in range(batch_size):
+            gen_np = generated[i].cpu().numpy()
+            batch_outputs.append(gen_np)
+            
+        return batch_outputs
 
     @torch.no_grad()
-    def solve_euler(self, x, audio_mert, spec_feat, t_start=0.0, t_end=1.0, steps=50):
+    def solve_euler(self, x, audio_mert, spec_feat, t_start=0.0, t_end=1.0, steps=50, desc="Solving ODE"):
         """Euler ODE Solver for Flow Matching"""
         dt = (t_end - t_start) / steps
         times = torch.linspace(t_start, t_end, steps + 1).to(self.device)
         
-        for i in range(steps):
+        # Progress bar for ODE steps
+        for i in tqdm(range(steps), desc=desc, leave=False):
             t_curr = torch.ones(x.shape[0], device=self.device) * times[i]
             # [수정] audio_mert를 직접 전달 (model 내부에서 MERT 추출)
             v_pred = self.model(x, t_curr, audio_mert, spec_feat)
@@ -120,54 +186,63 @@ class ADTInference:
         outputs = []
         
         print(f"Total samples: {total_samples}, Chunk: {chunk_samples}, Stride: {stride_samples}")
+        
+        # Calculate total number of chunks for progress bar
+        chunk_positions = list(range(0, total_samples, stride_samples))
+        total_chunks = len(chunk_positions)
+        print(f"Processing {total_chunks} audio chunks...")
+        
+        # [최적화] Multi-GPU 배치 처리를 위한 배치 사이즈
+        # GPU 메모리를 고려하여 동시 처리할 청크 수 결정
+        batch_size = min(self.num_gpus * 2, 4)  # GPU당 2개씩, 최대 4개
+        print(f"Using batch size: {batch_size} for parallel processing")
 
-        # Sliding Window
-        for start_idx in range(0, total_samples, stride_samples):
-            end_idx = min(start_idx + chunk_samples, total_samples)
-            wav_chunk = waveform[:, start_idx:end_idx]
-            original_len = wav_chunk.shape[1]
+        # Batch processing with progress bar
+        for batch_start in tqdm(range(0, total_chunks, batch_size), desc="Processing audio batches"):
+            batch_end = min(batch_start + batch_size, total_chunks)
+            batch_chunks = []
+            batch_info = []  # (start_idx, end_idx, original_len) 정보 저장
             
-            # 마지막 조각 패딩
-            if original_len < chunk_samples:
-                wav_chunk = torch.nn.functional.pad(wav_chunk, (0, chunk_samples - original_len))
+            # Prepare batch
+            for i in range(batch_start, batch_end):
+                start_idx = chunk_positions[i]
+                end_idx = min(start_idx + chunk_samples, total_samples)
+                wav_chunk = waveform[:, start_idx:end_idx]
+                original_len = wav_chunk.shape[1]
+                
+                # 마지막 조각 패딩
+                if original_len < chunk_samples:
+                    wav_chunk = torch.nn.functional.pad(wav_chunk, (0, chunk_samples - original_len))
+                
+                batch_chunks.append(wav_chunk)
+                batch_info.append((start_idx, end_idx, original_len))
             
-            # [수정] audio_mert를 직접 전달 (model 내부에서 MERT 추출)
-            audio_mert, spec_feat = self.get_features(wav_chunk, sr)
-            
-            # [수정] Output Dimension 계산 - spec_feat의 시간 길이를 사용
-            out_dim = self.config.DRUM_CHANNELS * self.config.FEATURE_DIM 
-            seq_len = spec_feat.shape[1]  # Spectrogram의 시간 길이
-            x_0 = torch.randn(spec_feat.shape[0], seq_len, out_dim).to(self.device)
-            
-            generated = self.solve_euler(x_0, audio_mert, spec_feat, steps=self.args.steps)
-            
-            if self.args.refine_step > 0:
-                t_refine = 1.0 - self.args.refine_strength
-                noise = torch.randn_like(generated)
-                x_refine = (1 - t_refine) * noise + t_refine * generated
-                refine_steps = int(self.args.steps * self.args.refine_strength)
-                generated = self.solve_euler(x_refine, audio_mert, spec_feat, t_start=t_refine, t_end=1.0, steps=refine_steps)
-
-            gen_np = generated[0].cpu().numpy()
-            
-            # [수정] Stitching (Overlap 제거) - FPS 기반 계산 통일
-            fps = self.config.FPS  # = AUDIO_SR / HOP_LENGTH = 100
-
-            # 앞부분 오버랩 제거
-            valid_start = int((OVERLAP_SEC / 2) * fps) if start_idx > 0 else 0
-            # 뒷부분 오버랩 제거
-            valid_end = int(gen_np.shape[0] - (OVERLAP_SEC / 2) * fps) if end_idx < total_samples else gen_np.shape[0]
-            
-            # 패딩 부분 제거
-            if original_len < chunk_samples:
-                # 유효한 오디오 길이 비율로 프레임 수 계산
-                ratio = original_len / chunk_samples
-                real_end_frame = int(gen_np.shape[0] * ratio)
-                valid_end = min(valid_end, real_end_frame)
-
-            # 유효 구간이 존재할 때만 추가
-            if valid_end > valid_start:
-                outputs.append(gen_np[valid_start:valid_end])
+            # Process batch
+            if batch_chunks:
+                batch_outputs = self.process_batch(batch_chunks, sr, batch_start, total_chunks)
+                
+                # Post-process each output in batch
+                for j, gen_np in enumerate(batch_outputs):
+                    start_idx, end_idx, original_len = batch_info[j]
+                    
+                    # [수정] Stitching (Overlap 제거) - FPS 기반 계산 통일
+                    fps = self.config.FPS  # = AUDIO_SR / HOP_LENGTH = 100
+        
+                    # 앞부분 오버랩 제거
+                    valid_start = int((OVERLAP_SEC / 2) * fps) if start_idx > 0 else 0
+                    # 뒷부분 오버랩 제거
+                    valid_end = int(gen_np.shape[0] - (OVERLAP_SEC / 2) * fps) if end_idx < total_samples else gen_np.shape[0]
+                    
+                    # 패딩 부분 제거
+                    if original_len < chunk_samples:
+                        # 유효한 오디오 길이 비율로 프레임 수 계산
+                        ratio = original_len / chunk_samples
+                        real_end_frame = int(gen_np.shape[0] * ratio)
+                        valid_end = min(valid_end, real_end_frame)
+        
+                    # 유효 구간이 존재할 때만 추가
+                    if valid_end > valid_start:
+                        outputs.append(gen_np[valid_start:valid_end])
 
         if len(outputs) == 0:
             print("Error: No audio processed or outputs are empty.")
@@ -189,7 +264,8 @@ class ADTInference:
         num_drums = self.config.DRUM_CHANNELS 
         has_notes = False
         
-        for i in range(num_drums):
+        # Process each drum channel with progress
+        for i in tqdm(range(num_drums), desc="Processing drum channels", leave=False):
             if i >= len(DRUM_MAPPING): continue
             drum_note = DRUM_MAPPING[i]
             
