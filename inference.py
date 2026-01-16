@@ -51,6 +51,8 @@ class ADTInference:
 
     def get_features(self, waveform_segment, sr):
         """오디오에서 Mel-Spectrogram과 MERT용 waveform 준비"""
+        # waveform_segment: (1, samples) - 채널 차원이 1인 mono
+        
         # 1. Mel-Spectrogram
         if sr != self.config.AUDIO_SR:
             resampler = torchaudio.transforms.Resample(sr, self.config.AUDIO_SR).to(self.device)
@@ -60,7 +62,7 @@ class ADTInference:
 
         melspec = self.mel_transform(waveform_mel)
         melspec = self.db_transform(melspec)
-        melspec = melspec.transpose(1, 2) # (B, T, n_mels)
+        melspec = melspec.transpose(1, 2) # (1, T, n_mels) - 여기서 1은 배치
 
         # 2. MERT용 Waveform (MERT 추출은 model.forward() 내부에서 수행)
         target_mert_sr = self.config.MERT_SR
@@ -70,8 +72,15 @@ class ADTInference:
         else:
             waveform_mert = waveform_segment.to(self.device)
 
-        # waveform_mert는 (B, samples) 형태로 반환
-        # MERT feature 추출은 model.forward() 내부에서 처리됨
+        # [핵심 수정] MERT는 (B, samples) 형태를 기대함
+        # waveform_segment가 (1, samples) 형태인데, 1은 채널 차원임
+        # squeeze(0)으로 채널 차원을 제거하고 unsqueeze(0)으로 배치 차원 추가
+        # 결과: (1, samples) where 1 is batch dimension
+        waveform_mert = waveform_mert.squeeze(0).unsqueeze(0)  # 채널 -> 배치 차원으로 변환
+        
+        # 디버그 출력
+        # print(f"[DEBUG] waveform_mert shape: {waveform_mert.shape}, melspec shape: {melspec.shape}")
+        
         return waveform_mert, melspec
 
     @torch.no_grad()

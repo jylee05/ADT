@@ -49,7 +49,7 @@ class Config:
     # 12 * 2(accum) = 24 (effective batch size)
     GRAD_ACCUM_STEPS = 2 
     
-    LR = 3e-4
+    LR = 1e-4  # [수정] 더 보수적인 learning rate
     EPOCHS = 100
     NUM_WORKERS = 4  # 1080 Ti는 CPU 병목 방지를 위해 4 권장
     DEVICE = "cuda"

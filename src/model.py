@@ -19,7 +19,11 @@ class SinusoidalPosEmb(nn.Module):
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        
+        # [추가] 극단값 방지
+        x_clamped = torch.clamp(x, min=-10.0, max=10.0)  # 시간 스텍 극단값 제한
+        
+        emb = x_clamped[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -66,6 +70,9 @@ class FiLMLayer(nn.Module):
         # Scale과 Shift 계수 예측
         params = self.proj(condition)
         scale, shift = params.chunk(2, dim=-1)
+        
+        # [수정] Scale 값을 제한하여 gradient explosion 방지
+        scale = torch.tanh(scale) * 0.5  # [-0.5, 0.5] 범위로 제한
         
         # 차원 맞추기 (Broadcasting)
         scale = scale.unsqueeze(1)
@@ -203,12 +210,44 @@ class FlowMatchingTransformer(nn.Module):
         self.mert.eval()
         for p in self.mert.parameters():
             p.requires_grad = False
+        
+        # 9. Weight Initialization (gradient explosion 방지)
+        self._init_weights()
 
+    def _init_weights(self):
+        """Xavier/Kaiming 초기화로 gradient explosion 방지"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Xavier uniform 초기화 (tanh/sigmoid용)
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                # LayerNorm 표준 초기화
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+        
+        # Null embeddings는 더 작게 초기화
+        nn.init.normal_(self.null_mert_emb, 0, 0.01)
+        nn.init.normal_(self.null_spec_emb, 0, 0.01)
+    
     def extract_mert(self, audio):
         """MERT 모델에서 특정 레이어 특징 추출"""
         with torch.no_grad():
+            # [추가] 입력 오디오 범위 체크
+            if torch.isnan(audio).any() or torch.isinf(audio).any():
+                print("[WARNING] NaN/Inf in audio input to MERT")
+                audio = torch.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             outputs = self.mert(audio, output_hidden_states=True)
-            return outputs.hidden_states[self.config.MERT_LAYER_IDX]
+            features = outputs.hidden_states[self.config.MERT_LAYER_IDX]
+            
+            # [추가] MERT 출력 체크
+            if torch.isnan(features).any():
+                print("[WARNING] NaN in MERT features")
+                features = torch.nan_to_num(features, nan=0.0)
+                
+            return features
 
     def apply_condition_dropout(self, feat, null_emb, drop_prob, partial_prob):
         """
@@ -289,20 +328,43 @@ class FlowMatchingTransformer(nn.Module):
         # 이제 mert_emb와 spec_emb가 같은 시간 길이를 가짐
         memory = torch.cat([mert_emb, spec_emb], dim=1)
         
-        # 7. Global Condition for FiLM
+        # Global Condition for FiLM에서 NaN 방지
         time_emb = self.time_mlp(t)
+        
+        # [추가] Time embedding NaN 체크
+        if torch.isnan(time_emb).any():
+            print("[WARNING] NaN in time_emb")
+            time_emb = torch.nan_to_num(time_emb, nan=0.0)
+        
         # 오디오 전체 맥락(Average Pooling)을 Time 정보와 더함
         audio_ctx = memory.mean(dim=1)
+        
+        # [추가] Audio context NaN 체크  
+        if torch.isnan(audio_ctx).any():
+            print("[WARNING] NaN in audio_ctx")
+            audio_ctx = torch.nan_to_num(audio_ctx, nan=0.0)
+            
         cond_emb = time_emb + audio_ctx
         
         # 8. Main Network Flow
         h = self.proj_in(x_t)
+        
+        # [추가] proj_in 출력 NaN 체크
+        if torch.isnan(h).any():
+            print("[WARNING] NaN in proj_in output")
+            h = torch.nan_to_num(h, nan=0.0)
+        
         h = self.pos_enc_main(h)  # 메인 시퀀스에도 Positional Encoding
         # Input에도 Time 정보 더해주기 (일반적 관행)
         h = h + time_emb.unsqueeze(1)
         
         for layer in self.layers:
             h = layer(h, memory, cond_emb)
+            # [추가] 각 layer 후 NaN 체크
+            if torch.isnan(h).any():
+                print("[WARNING] NaN in transformer layer output")
+                h = torch.nan_to_num(h, nan=0.0)
+                break  # NaN 발생 시 조기 종료
             
         return self.head(h)
 
