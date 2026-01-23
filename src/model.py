@@ -425,7 +425,14 @@ class AnnealedPseudoHuberLoss(nn.Module):
         diff = pred_v - target_v
         c = self.get_c(progress)
         loss = torch.sqrt(diff.pow(2) + c**2) - c
-        return loss.mean()
+        
+        # [Fine-tuning] Positive Weighting for better Recall
+        # 드럼 타격이 있는 구간(target_score > 0)에 10배 가중치 적용
+        is_hit = (target_score > 0).float()
+        weight_mask = 1.0 + (9.0 * is_hit)  # Hit: 10x weight, Silence: 1x weight
+        weighted_loss = loss * weight_mask
+        
+        return weighted_loss.mean()
 
     @torch.no_grad()
     def sample(self, audio_mert, spec, steps=10, init_score=None, start_t=0.0):
