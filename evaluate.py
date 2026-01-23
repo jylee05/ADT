@@ -123,7 +123,7 @@ class ModelEvaluator:
             all_losses.append(loss.item())
             
             # Generate predictions using sampling
-            eval_steps = 5 if self.args.quick else self.args.eval_steps  # Quick: 5 steps only
+            eval_steps = self.args.eval_steps  
             predictions = self.loss_fn.sample(audio_mert, spec, steps=eval_steps)
             
             # Process each sample in batch
