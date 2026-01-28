@@ -45,13 +45,13 @@ class Config:
     # 남은 메모리로 배치 처리
     # GPU 2개: 배치 12 -> GPU당 6개 (11GB에서 여유 있음)
     # OOM 발생 시 8로 낮추기
-    BATCH_SIZE = 12
-    # 12 * 2(accum) = 24 (effective batch size)
-    GRAD_ACCUM_STEPS = 2 
+    BATCH_SIZE = 14
+
+    GRAD_ACCUM_STEPS = 6
     
     LR = 1e-4  # [수정] 더 보수적인 learning rate
     EPOCHS = 100
-    NUM_WORKERS = 4  # 1080 Ti는 CPU 병목 방지를 위해 4 권장
+    NUM_WORKERS = 8 # 8로 늘림  # 1080 Ti는 CPU 병목 방지를 위해 4 권장
     DEVICE = "cuda"
     
     C_MAX = 1.0

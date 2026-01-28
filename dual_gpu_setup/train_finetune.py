@@ -7,18 +7,23 @@ Fine-tuning Script for N2N Flow Matching Drum Transcription
 - Gradient clipping for stability
 """
 
+# [중요] 모든 import 전에 CUDA 설정 (train_from65epoch.py 스타일)
 import os
-# [중요] 0번, 1번 GPU만 보이게 설정 (코드 최상단 위치)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+# 2. [필수 추가] GPU 간 통신 에러 방지 (시스템 메모리 사용 강제)
+# 하드웨어 상태가 불안정할 때 멈춤 현상을 막아줍니다.
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
 
 import argparse
 import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from datetime import datetime
 from tqdm import tqdm
@@ -30,17 +35,6 @@ from src.utils import seed_everything
 
 # Gradient Clipping을 위한 max norm (Flow Matching에 적합하게 조정)
 MAX_GRAD_NORM = 1.0  # Flow Matching에 적합한 값
-
-def check_for_nan(tensor, name):
-    """NaN 체크 유틸리티"""
-    if torch.isnan(tensor).any():
-        print(f"[WARNING] NaN detected in {name}!")
-        return True
-    if torch.isinf(tensor).any():
-        print(f"[WARNING] Inf detected in {name}!")
-        return True
-    return False
-from src.utils import seed_everything
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, config):
     """Save training checkpoint"""
@@ -83,48 +77,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, config)
     torch.save(checkpoint, save_path)
     print(f"💾 Checkpoint saved: {save_path}")
 
-def load_checkpoint_for_finetune(model, checkpoint_path):
-    """
-    Fine-tuning용 체크포인트 로드
-    - 모델 가중치만 로드 (optimizer/scheduler는 새로 초기화)
-    """
-    print(f"📂 Loading checkpoint for fine-tuning: {checkpoint_path}")
-    
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-    # Model state dict 로드
-    model_state_dict = checkpoint.get('model_state_dict', checkpoint)
-    
-    # Handle DataParallel naming
-    if hasattr(model, 'module'):
-        # Current model is DataParallel
-        if not any(k.startswith('module.') for k in model_state_dict.keys()):
-            # Checkpoint is not DataParallel -> add 'module.' prefix
-            new_state_dict = {'module.' + k: v for k, v in model_state_dict.items()}
-            model.load_state_dict(new_state_dict)
-        else:
-            model.load_state_dict(model_state_dict)
-    else:
-        # Current model is not DataParallel
-        if any(k.startswith('module.') for k in model_state_dict.keys()):
-            # Checkpoint is DataParallel -> remove 'module.' prefix
-            new_state_dict = {k.replace('module.', ''): v for k, v in model_state_dict.items()}
-            model.load_state_dict(new_state_dict)
-        else:
-            model.load_state_dict(model_state_dict)
-    
-    # 로드된 체크포인트 정보 출력
-    loaded_epoch = checkpoint.get('epoch', 'Unknown')
-    loaded_loss = checkpoint.get('loss', 'Unknown')
-    
-    print(f"✅ Model weights loaded successfully!")
-    print(f"   - Original epoch: {loaded_epoch}")
-    print(f"   - Original loss: {loaded_loss}")
-    print(f"   - Optimizer/Scheduler: Freshly initialized for fine-tuning")
-    
-    return model
-
-def train_epoch(model, loss_fn, train_loader, optimizer, scheduler, scaler, epoch, total_epochs, writer, device, config):
+def train_epoch(model, loss_fn, train_loader, optimizer, scheduler, scaler, epoch, total_epochs, device, config):
     """Train one epoch with fine-tuning settings"""
     model.train()
     total_loss = 0.0
@@ -151,13 +104,13 @@ def train_epoch(model, loss_fn, train_loader, optimizer, scheduler, scaler, epoc
         target_grid = target_grid.to(device)
         
         # [추가] 입력 데이터 NaN 체크
-        if check_for_nan(audio_mert, "audio_mert") or check_for_nan(spec, "spec") or check_for_nan(target_grid, "target_grid"):
+        if torch.isnan(audio_mert).any() or torch.isnan(spec).any() or torch.isnan(target_grid).any():
             print(f"Skipping batch {batch_idx} due to NaN in input")
             nan_count += 1
             continue
         
-        # Forward pass with mixed precision
-        with autocast():
+        # Forward pass with mixed precision (train_from65epoch.py 스타일)
+        with autocast('cuda'):
             loss = loss_fn(audio_mert, spec, target_grid, progress)
             loss = loss / config.GRAD_ACCUM_STEPS  # Gradient accumulation
         
@@ -205,12 +158,8 @@ def train_epoch(model, loss_fn, train_loader, optimizer, scheduler, scaler, epoc
                 'progress': f'{progress:.3f}'
             })
             
-            # TensorBoard logging
+            # 기본 로깅만 유지
             global_step = epoch * (num_batches // config.GRAD_ACCUM_STEPS) + ((batch_idx + 1) // config.GRAD_ACCUM_STEPS)
-            if writer:
-                writer.add_scalar('Train/BatchLoss', batch_loss, global_step)
-                writer.add_scalar('Train/LearningRate', scheduler.get_last_lr()[0], global_step)
-                writer.add_scalar('Train/Progress', progress, global_step)
     
     # Step scheduler (CosineAnnealingLR)
     scheduler.step()
@@ -222,52 +171,12 @@ def train_epoch(model, loss_fn, train_loader, optimizer, scheduler, scaler, epoc
     avg_loss = total_loss / max((num_batches // config.GRAD_ACCUM_STEPS) - nan_count, 1)
     return avg_loss
 
-def validate_epoch(model, loss_fn, val_loader, epoch, total_epochs, writer, device, config):
-    """Validation epoch"""
-    model.eval()
-    total_loss = 0.0
-    num_batches = len(val_loader)
-    
-    # [Fine-tuning] Progress calculation for validation
-    progress = epoch / total_epochs
-    
-    with torch.no_grad():
-        progress_bar = tqdm(val_loader, desc=f'Validation {epoch+1}/{total_epochs}')
-        progress_bar.set_postfix({'val_loss': '---'})
-        
-        for batch_idx, (audio_mert, spec, target_grid) in enumerate(progress_bar):
-            # Move to device
-            audio_mert = audio_mert.to(device)
-            spec = spec.to(device)
-            target_grid = target_grid.to(device)
-            
-            # Forward pass
-            with autocast():
-                loss = loss_fn(audio_mert, spec, target_grid, progress)
-            
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            
-            # Update progress bar
-            avg_loss = total_loss / (batch_idx + 1)
-            progress_bar.set_postfix({'val_loss': f'{avg_loss:.4f}'})
-    
-    avg_loss = total_loss / num_batches
-    
-    # TensorBoard logging
-    if writer:
-        writer.add_scalar('Validation/Loss', avg_loss, epoch)
-    
-    return avg_loss
-
 def main():
     parser = argparse.ArgumentParser(description='Fine-tune N2N Flow Matching Model')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint for fine-tuning')
     parser.add_argument('--output_dir', type=str, default='saved_models_finetune',
                         help='Directory to save fine-tuned models')
-    parser.add_argument('--log_dir', type=str, default='logs_finetune',
-                        help='TensorBoard log directory')
     parser.add_argument('--save_interval', type=int, default=5,
                         help='Save checkpoint every N epochs')
     parser.add_argument('--resume', type=str, default=None,
@@ -293,34 +202,59 @@ def main():
     
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
     
-    # Initialize model
+    # Initialize model (train_from65epoch.py 스타일)
+    print("🤖 Initializing Flow Matching Transformer...")
     model = FlowMatchingTransformer(config).to(device)
+    
+    # Load checkpoint BEFORE DataParallel setup (train_from65epoch.py 스타일)
+    print(f"📂 Loading checkpoint for fine-tuning: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    
+    # Model state dict 로드 (single GPU 모델로 먼저 로드)
+    model_state_dict = checkpoint.get('model_state_dict', checkpoint)
+    
+    # Handle DataParallel naming mismatch
+    if any(k.startswith('module.') for k in model_state_dict.keys()):
+        # Checkpoint is DataParallel -> remove 'module.' prefix for single model
+        new_state_dict = {k.replace('module.', ''): v for k, v in model_state_dict.items()}
+        model.load_state_dict(new_state_dict)
+        print("✅ Loaded DataParallel checkpoint into single model")
+    else:
+        model.load_state_dict(model_state_dict)
+        print("✅ Loaded single model checkpoint")
+    
+    # 로드된 체크포인트 정보 출력
+    loaded_epoch = checkpoint.get('epoch', 'Unknown')
+    loaded_loss = checkpoint.get('loss', 'Unknown')
+    print(f"   - Original epoch: {loaded_epoch}")
+    print(f"   - Original loss: {loaded_loss}")
+    print(f"   - Optimizer/Scheduler: Freshly initialized for fine-tuning")
+    
+    # Multi-GPU setup AFTER model loading (train_from65epoch.py 스타일)
+    if torch.cuda.device_count() > 1:
+        print(f"🚀 Setting up DataParallel with {torch.cuda.device_count()} GPUs: {list(range(torch.cuda.device_count()))}")
+        model = nn.DataParallel(model)
+        print("✅ DataParallel setup completed")
+    else:
+        print(f"🔧 Using single GPU: {device}")
+    
+    # Loss function 초기화는 DataParallel 후에 (train_from65epoch.py 스타일)
     loss_fn = AnnealedPseudoHuberLoss(model, config).to(device)
     
-    # Multi-GPU setup
-    if torch.cuda.device_count() > 1:
-        print(f"🚀 Using {torch.cuda.device_count()} GPUs for fine-tuning")
-        model = nn.DataParallel(model)
-        loss_fn.model = model
-    
-    # Load checkpoint for fine-tuning (model weights only)
-    model = load_checkpoint_for_finetune(model, args.checkpoint)
-    
-    # [Fine-tuning] Fresh optimizer and scheduler setup
+    # [Fine-tuning] Fresh optimizer and scheduler setup (train_from65epoch.py 스타일)
+    print("⚙️ Setting up optimizer and scheduler...")
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=50, eta_min=1e-6
     )
     
-    # Mixed precision scaler
+    # Mixed precision scaler (train_from65epoch.py 스타일)
     scaler = GradScaler()
     
-    # Data loaders
+    # Data loaders (train_from65epoch.py 스타일)
     print("📁 Loading datasets...")
     train_dataset = EGMDDataset(is_train=True)
-    val_dataset = EGMDDataset(is_train=False)
     
     train_loader = DataLoader(
         train_dataset,
@@ -330,38 +264,30 @@ def main():
         pin_memory=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    
-    print(f"📊 Dataset sizes:")
+    print(f"📊 Dataset size:")
     print(f"   Train: {len(train_dataset)} samples")
-    print(f"   Validation: {len(val_dataset)} samples")
     
-    # TensorBoard writer
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(args.log_dir, f"finetune_{timestamp}")
-    writer = SummaryWriter(log_path)
-    
-    # Resume from fine-tuning checkpoint if specified
+    # Resume from fine-tuning checkpoint if specified (train_from65epoch.py 스타일)
     start_epoch = 0
     if args.resume:
         print(f"📂 Resuming fine-tuning from: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
+        resume_checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         
         # Load everything for resume (different from initial load)
         if hasattr(model, 'module'):
-            model.module.load_state_dict(checkpoint['model_state_dict'])
+            model.module.load_state_dict(resume_checkpoint['model_state_dict'])
         else:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # Handle DataParallel mismatch in resume checkpoint
+            resume_state_dict = resume_checkpoint['model_state_dict']
+            if any(k.startswith('module.') for k in resume_state_dict.keys()):
+                new_state_dict = {k.replace('module.', ''): v for k, v in resume_state_dict.items()}
+                model.load_state_dict(new_state_dict)
+            else:
+                model.load_state_dict(resume_state_dict)
         
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
+        optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(resume_checkpoint['scheduler_state_dict'])
+        start_epoch = resume_checkpoint['epoch'] + 1
         
         print(f"✅ Resumed from epoch {start_epoch}")
     
@@ -377,39 +303,27 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         epoch_start_time = time.time()
         
-        # Training
+        # Training (Validation 제거)
         train_loss = train_epoch(
             model, loss_fn, train_loader, optimizer, scheduler, scaler,
-            epoch, total_epochs, writer, device, config
-        )
-        
-        # Validation
-        val_loss = validate_epoch(
-            model, loss_fn, val_loader, epoch, total_epochs, writer, device, config
+            epoch, total_epochs, device, config
         )
         
         # Timing
         epoch_time = time.time() - epoch_start_time
         
-        # Logging
+        # Logging (TensorBoard 제거)
         print(f"\nEpoch {epoch+1}/{total_epochs} Summary:")
         print(f"   Train Loss: {train_loss:.6f}")
-        print(f"   Val Loss: {val_loss:.6f}")
         print(f"   Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
         print(f"   Time: {epoch_time:.1f}s")
         
-        # TensorBoard
-        writer.add_scalars('Loss/Epoch', {
-            'train': train_loss,
-            'validation': val_loss
-        }, epoch)
-        
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Save best model (Training Loss 기준)
+        if train_loss < best_val_loss:
+            best_val_loss = train_loss
             best_model_path = os.path.join(args.output_dir, 'best_model_finetune.pth')
-            save_checkpoint(model, optimizer, scheduler, epoch, val_loss, best_model_path, config)
-            print(f"🏆 New best validation loss: {val_loss:.6f}")
+            save_checkpoint(model, optimizer, scheduler, epoch, train_loss, best_model_path, config)
+            print(f"🏆 New best training loss: {train_loss:.6f}")
         
         # Periodic save
         if (epoch + 1) % args.save_interval == 0:
@@ -423,11 +337,8 @@ def main():
     save_checkpoint(model, optimizer, scheduler, total_epochs-1, train_loss, final_path, config)
     
     print(f"\n🎉 Fine-tuning completed!")
-    print(f"   Best validation loss: {best_val_loss:.6f}")
+    print(f"   Best training loss: {best_val_loss:.6f}")
     print(f"   Models saved in: {args.output_dir}")
-    print(f"   TensorBoard logs: {log_path}")
-    
-    writer.close()
 
 if __name__ == '__main__':
     main()

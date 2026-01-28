@@ -2,9 +2,16 @@
 """
 Model Evaluation Script for N2N Flow Matching Drum Transcription
 Evaluates checkpoint performance on validation data
+- Modified to use ONLY Physical GPU 1
+- Fixed Velocity Scaling (Raw -> 1~127)
+- Fixed mir_eval logic (Manual Velocity Matching Implementation)
 """
 
 import os
+
+# [설정] 무조건 물리적 GPU 1번만 사용하도록 강제
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 import argparse
 import torch
 import torch.nn.functional as F
@@ -16,7 +23,7 @@ from scipy.signal import find_peaks
 from tqdm import tqdm
 import json
 from pathlib import Path
-import mir_eval  # [추가] 논문 표준 평가를 위한 mir_eval
+import mir_eval 
 
 from src.config import Config
 from src.model import FlowMatchingTransformer, AnnealedPseudoHuberLoss
@@ -27,40 +34,40 @@ DRUM_NAMES = ["Kick", "Snare", "HH", "Toms", "Crash", "Ride", "Bell"]
 
 class ModelEvaluator:
     def __init__(self, args):
-        self.args = args  # args를 instance variable로 저장
+        self.args = args 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = Config()
         
         print(f"🔧 Loading model from: {args.ckpt_path}")
+        print(f"   Target Device: {self.device} (Mapped to Physical GPU 1)")
         
         # Load model
         self.model = FlowMatchingTransformer(self.config).to(self.device)
         self.loss_fn = AnnealedPseudoHuberLoss(self.model, self.config).to(self.device)
         self.load_checkpoint(args.ckpt_path)
         
-        # Multi-GPU support
+        # GPU 개수가 1개로 제한되었으므로 DataParallel은 건너뜀
         if torch.cuda.device_count() > 1:
-            print(f"🚀 Using {torch.cuda.device_count()} GPUs")
             self.model = torch.nn.DataParallel(self.model)
             self.loss_fn.model = self.model
+        else:
+            print("🔧 Running in Single GPU Mode")
         
         self.model.eval()
         
         # Load validation dataset
         print("📁 Loading validation dataset...")
-        self.val_dataset = EGMDDataset(is_train=False)  # Use validation mode
+        self.val_dataset = EGMDDataset(is_train=False)  
         
         # [빠른 평가] 샘플 수 제한
         if args.quick:
-            # Quick evaluation: 200 samples only (5분 내 완료)
             total_samples = min(200, len(self.val_dataset))
             print(f"⚡ Quick evaluation mode: using {total_samples} samples only")
-            # Random subset for better representation
             indices = np.random.choice(len(self.val_dataset), total_samples, replace=False)
             subset_dataset = torch.utils.data.Subset(self.val_dataset, indices)
             self.val_loader = torch.utils.data.DataLoader(
                 subset_dataset,
-                batch_size=16,  # Larger batch for speed
+                batch_size=16, 
                 shuffle=False,
                 num_workers=4,
                 pin_memory=True
@@ -77,14 +84,12 @@ class ModelEvaluator:
         
         dataset_size = total_samples if args.quick else len(self.val_dataset)
         print(f"✅ Evaluation setup complete!")
-        print(f"   - Model: {self.config.HIDDEN_DIM}D, {self.config.N_LAYERS} layers")
-        print(f"   - Validation samples: {dataset_size}")
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
+        # weights_only=False로 설정하여 사용자 정의 객체 로드 허용
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
-        # Handle DataParallel state dict
         if any(k.startswith('module.') for k in state_dict.keys()):
             new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         else:
@@ -92,7 +97,6 @@ class ModelEvaluator:
             
         self.model.load_state_dict(new_state_dict)
         
-        # Extract training info if available
         self.epoch = checkpoint.get('epoch', 'Unknown')
         self.train_loss = checkpoint.get('loss', 'Unknown')
         print(f"   - Checkpoint epoch: {self.epoch}")
@@ -106,10 +110,10 @@ class ModelEvaluator:
         # Storage for metrics
         all_losses = []
         frame_preds, frame_targets = [], []
-        onset_preds, onset_targets = [], []  # mir_eval용 onset 데이터
-        velocity_preds, velocity_targets = [], []  # mir_eval용 velocity 데이터
-        velocity_errors = []  # 기존 velocity MAE 계산용
-        per_drum_metrics = {i: {'tp': 0, 'fp': 0, 'fn': 0} for i in range(self.config.DRUM_CHANNELS)}  # 기존 per-drum 유지
+        onset_preds, onset_targets = [], []  
+        velocity_preds, velocity_targets = [], [] 
+        velocity_errors = []  
+        per_drum_metrics = {i: {'tp': 0, 'fp': 0, 'fn': 0} for i in range(self.config.DRUM_CHANNELS)}
         
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
@@ -118,44 +122,47 @@ class ModelEvaluator:
             spec = spec.to(self.device)
             target_grid = target_grid.to(self.device)
             
-            # Calculate loss (using progress=0.5 for mid-training evaluation)
+            # Loss Calculation
             loss = self.loss_fn(audio_mert, spec, target_grid, progress=0.5)
             all_losses.append(loss.item())
             
-            # Generate predictions using sampling
+            # Generate predictions
             eval_steps = self.args.eval_steps  
             predictions = self.loss_fn.sample(audio_mert, spec, steps=eval_steps)
             
             # Process each sample in batch
             for i in range(predictions.shape[0]):
-                pred_sample = predictions[i].cpu().numpy()  # (T, 14)
-                target_sample = target_grid[i].cpu().numpy()  # (T, 14)
+                pred_sample = predictions[i].cpu().numpy()  
+                target_sample = target_grid[i].cpu().numpy() 
                 
-                # Split into onset and velocity
-                pred_onset = pred_sample[:, :self.config.DRUM_CHANNELS]  # (T, 7)
-                pred_velocity = pred_sample[:, self.config.DRUM_CHANNELS:]  # (T, 7)
+                pred_onset = pred_sample[:, :self.config.DRUM_CHANNELS]
+                pred_velocity = pred_sample[:, self.config.DRUM_CHANNELS:]
                 target_onset = target_sample[:, :self.config.DRUM_CHANNELS]
                 target_velocity = target_sample[:, self.config.DRUM_CHANNELS:]
                 
-                # Frame-level evaluation (threshold-based)
+                # Frame-level evaluation (Binary)
                 pred_onset_binary = (pred_onset > 0.0).astype(int)
-                target_onset_binary = (target_onset > -0.5).astype(int)  # -1 = silence, >-0.5 = active
+                target_onset_binary = (target_onset > -0.5).astype(int)
                 
                 frame_preds.append(pred_onset_binary.flatten())
                 frame_targets.append(target_onset_binary.flatten())
                 
-                # [논문 표준] mir_eval용 note-level 데이터 준비
+                # mir_eval용 list
                 pred_notes_onset = []
                 pred_notes_velocity = []
                 target_notes_onset = []
                 target_notes_velocity = []
                 
+                # [Velocity 변환 함수] Raw(-1~1) -> MIDI(1~127)
+                def denorm_vel(val):
+                    return np.clip(((val + 1) / 2) * 127, 1, 127)
+
                 for drum_idx in range(self.config.DRUM_CHANNELS):
-                    # Peak detection for predictions
+                    # Peak detection
                     pred_peaks, _ = find_peaks(pred_onset[:, drum_idx], height=0.0, distance=3)
                     target_peaks = np.where(target_onset[:, drum_idx] > -0.5)[0]
                     
-                    # [기존 유지] per-drum metrics 계산 (30ms tolerance)
+                    # [기존 유지] per-drum metrics (30ms tolerance)
                     tp = 0
                     matched_targets = set()
                     for pred_peak in pred_peaks:
@@ -172,47 +179,49 @@ class ModelEvaluator:
                     per_drum_metrics[drum_idx]['fp'] += fp
                     per_drum_metrics[drum_idx]['fn'] += fn
                     
-                    # [논문 표준] mir_eval용 데이터 생성 (50ms tolerance, 100ms duration)
-                    frame_to_sec = 1.0 / self.config.FPS  # 100 FPS -> 0.01초
+                    frame_to_sec = 1.0 / self.config.FPS
                     
-                    # Predicted notes
+                    # [Prediction Note 생성] Velocity 변환 적용
                     for peak_frame in pred_peaks:
                         onset_time = peak_frame * frame_to_sec
-                        velocity_val = pred_velocity[peak_frame, drum_idx]  # 해당 frame의 velocity
-                        # [수정] pitch는 1-based indexing (mir_eval 요구사항)
+                        raw_vel = pred_velocity[peak_frame, drum_idx]
+                        real_vel = denorm_vel(raw_vel)  # 변환!
+                        
                         pred_notes_onset.append([onset_time, drum_idx + 1])
-                        pred_notes_velocity.append([onset_time, drum_idx + 1, velocity_val])
+                        pred_notes_velocity.append([onset_time, drum_idx + 1, real_vel])
                     
-                    # Target notes
+                    # [Target Note 생성] Velocity 변환 적용
                     for peak_frame in target_peaks:
                         onset_time = peak_frame * frame_to_sec
-                        velocity_val = target_velocity[peak_frame, drum_idx]
-                        # [수정] pitch는 1-based indexing (mir_eval 요구사항)
+                        raw_vel = target_velocity[peak_frame, drum_idx]
+                        real_vel = denorm_vel(raw_vel)  # 변환!
+                        
                         target_notes_onset.append([onset_time, drum_idx + 1])
-                        target_notes_velocity.append([onset_time, drum_idx + 1, velocity_val])
+                        target_notes_velocity.append([onset_time, drum_idx + 1, real_vel])
                 
-                # mir_eval 형식으로 저장
                 onset_preds.append(pred_notes_onset)
                 onset_targets.append(target_notes_onset)
                 velocity_preds.append(pred_notes_velocity)
                 velocity_targets.append(target_notes_velocity)
                 
-                # Velocity evaluation (only for active frames)
+                # [Velocity MAE/MSE 계산]
                 active_mask = target_onset_binary > 0
                 if np.any(active_mask):
                     active_pred_vel = pred_velocity[active_mask]
                     active_target_vel = target_velocity[active_mask]
-                    vel_errors = np.abs(active_pred_vel - active_target_vel)
+                    
+                    real_pred = denorm_vel(active_pred_vel)
+                    real_target = denorm_vel(active_target_vel)
+                    
+                    vel_errors = np.abs(real_pred - real_target)
                     velocity_errors.extend(vel_errors.flatten())
             
-            # Update progress
             avg_loss = np.mean(all_losses)
             progress_bar.set_postfix({'loss': f'{avg_loss:.4f}'})
         
-        # [논문 표준] mir_eval을 사용한 note-level 평가
-        print("\n📊 Computing mir_eval metrics (paper standard)...")
+        # mir_eval 평가 준비
+        print("\n📊 Computing mir_eval metrics (Core Function)...")
         
-        # 모든 샘플의 notes를 합치기 (시간 offset 추가)
         all_pred_onset_intervals, all_pred_onset_pitches = [], []
         all_target_onset_intervals, all_target_onset_pitches = [], []
         all_pred_velocity_intervals, all_pred_velocity_pitches, all_pred_velocities = [], [], []
@@ -222,12 +231,11 @@ class ModelEvaluator:
         for sample_idx, (pred_onset_notes, target_onset_notes, pred_vel_notes, target_vel_notes) in enumerate(
             zip(onset_preds, onset_targets, velocity_preds, velocity_targets)
         ):
-            # Onset 데이터 처리
+            # Onset Only Data
             if pred_onset_notes:
                 pred_notes = np.array(pred_onset_notes)
                 pred_times = pred_notes[:, 0] + time_offset
                 pred_pitches = pred_notes[:, 1].astype(int)
-                # 100ms duration (논문 설정)
                 pred_intervals = np.column_stack([pred_times, pred_times + 0.1])
                 all_pred_onset_intervals.append(pred_intervals)
                 all_pred_onset_pitches.append(pred_pitches)
@@ -240,12 +248,12 @@ class ModelEvaluator:
                 all_target_onset_intervals.append(target_intervals)
                 all_target_onset_pitches.append(target_pitches)
             
-            # Velocity 데이터 처리
+            # Velocity Data (이미 denorm_vel 적용됨)
             if pred_vel_notes:
                 pred_vel_array = np.array(pred_vel_notes)
                 pred_times = pred_vel_array[:, 0] + time_offset
                 pred_pitches = pred_vel_array[:, 1].astype(int)
-                pred_vels = pred_vel_array[:, 2]
+                pred_vels = pred_vel_array[:, 2] # 1~127 scale
                 pred_intervals = np.column_stack([pred_times, pred_times + 0.1])
                 all_pred_velocity_intervals.append(pred_intervals)
                 all_pred_velocity_pitches.append(pred_pitches)
@@ -255,16 +263,15 @@ class ModelEvaluator:
                 target_vel_array = np.array(target_vel_notes)
                 target_times = target_vel_array[:, 0] + time_offset
                 target_pitches = target_vel_array[:, 1].astype(int)
-                target_vels = target_vel_array[:, 2]
+                target_vels = target_vel_array[:, 2] # 1~127 scale
                 target_intervals = np.column_stack([target_times, target_times + 0.1])
                 all_target_velocity_intervals.append(target_intervals)
                 all_target_velocity_pitches.append(target_pitches)
                 all_target_velocities.append(target_vels)
             
-            # 6초 간격 (샘플 간 겹침 방지)
             time_offset += 6.0
         
-        # 배열 합치기
+        # Combine arrays
         final_pred_onset_intervals = np.vstack(all_pred_onset_intervals) if all_pred_onset_intervals else np.empty((0, 2))
         final_pred_onset_pitches = np.concatenate(all_pred_onset_pitches) if all_pred_onset_pitches else np.array([], dtype=int)
         final_target_onset_intervals = np.vstack(all_target_onset_intervals) if all_target_onset_intervals else np.empty((0, 2))
@@ -277,42 +284,91 @@ class ModelEvaluator:
         final_target_velocity_pitches = np.concatenate(all_target_velocity_pitches) if all_target_velocity_pitches else np.array([], dtype=int)
         final_target_velocities = np.concatenate(all_target_velocities) if all_target_velocities else np.array([])
         
-        # mir_eval로 onset transcription 평가 (50ms tolerance)
+        # 데이터 정렬 (mir_eval 안정성 확보)
+        if len(final_pred_onset_intervals) > 0:
+            sort_idx = np.argsort(final_pred_onset_intervals[:, 0])
+            final_pred_onset_intervals = final_pred_onset_intervals[sort_idx]
+            final_pred_onset_pitches = final_pred_onset_pitches[sort_idx]
+            
+        if len(final_target_onset_intervals) > 0:
+            sort_idx = np.argsort(final_target_onset_intervals[:, 0])
+            final_target_onset_intervals = final_target_onset_intervals[sort_idx]
+            final_target_onset_pitches = final_target_onset_pitches[sort_idx]
+
+        if len(final_pred_velocity_intervals) > 0:
+            sort_idx = np.argsort(final_pred_velocity_intervals[:, 0])
+            final_pred_velocity_intervals = final_pred_velocity_intervals[sort_idx]
+            final_pred_velocity_pitches = final_pred_velocity_pitches[sort_idx]
+            final_pred_velocities = final_pred_velocities[sort_idx]
+
+        if len(final_target_velocity_intervals) > 0:
+            sort_idx = np.argsort(final_target_velocity_intervals[:, 0])
+            final_target_velocity_intervals = final_target_velocity_intervals[sort_idx]
+            final_target_velocity_pitches = final_target_velocity_pitches[sort_idx]
+            final_target_velocities = final_target_velocities[sort_idx]
+
+        # =========================================================================
+        # 1. Onset Only Evaluation (velocity 상관 없음)
+        # =========================================================================
         try:
-            onset_scores = mir_eval.transcription.evaluate(
+            # offset_ratio=None으로 설정하면 offset은 무시함 (Onset만 평가)
+            p, r, f, _ = mir_eval.transcription.precision_recall_f1_overlap(
                 ref_intervals=final_target_onset_intervals,
                 ref_pitches=final_target_onset_pitches,
                 est_intervals=final_pred_onset_intervals,
                 est_pitches=final_pred_onset_pitches,
-                onset_tolerance=0.05,  # 50ms (논문 설정)
-                pitch_tolerance=0.0,   # 정확한 pitch 매치
-                offset_tolerance=None   # onset만 평가
-            )
-            mir_onset_f1 = onset_scores['F-measure']
-            mir_onset_precision = onset_scores['Precision']
-            mir_onset_recall = onset_scores['Recall']
-        except Exception as e:
-            print(f"Warning: mir_eval onset evaluation failed ({e})")
-            mir_onset_f1 = mir_onset_precision = mir_onset_recall = 0.0
-        
-        # mir_eval로 velocity transcription 평가 (50ms tolerance + velocity)
-        try:
-            velocity_scores = mir_eval.transcription.evaluate(
-                ref_intervals=final_target_velocity_intervals,
-                ref_pitches=final_target_velocity_pitches,
-                ref_velocities=final_target_velocities,
-                est_intervals=final_pred_velocity_intervals,
-                est_pitches=final_pred_velocity_pitches,
-                est_velocities=final_pred_velocities,
                 onset_tolerance=0.05,
                 pitch_tolerance=0.0,
-                velocity_tolerance=0.1  # velocity tolerance
+                offset_ratio=None 
             )
-            mir_velocity_f1 = velocity_scores['F-measure']
-            mir_velocity_precision = velocity_scores['Precision']
-            mir_velocity_recall = velocity_scores['Recall']
+            mir_onset_precision, mir_onset_recall, mir_onset_f1 = p, r, f
         except Exception as e:
-            print(f"Warning: mir_eval velocity evaluation failed ({e})")
+            print(f"❌ Error in mir_eval onset evaluation: {e}")
+            mir_onset_f1 = mir_onset_precision = mir_onset_recall = 0.0
+
+        # =========================================================================
+        # 2. Onset + Velocity Evaluation (수동 매칭 구현)
+        # =========================================================================
+        try:
+            # Step 1: 먼저 Onset 기준으로 매칭되는 노트들의 인덱스를 구함
+            # match_notes 함수를 사용 (offset_ratio=None으로 offset 무시)
+            matches = mir_eval.transcription.match_notes(
+                ref_intervals=final_target_velocity_intervals,
+                ref_pitches=final_target_velocity_pitches,
+                est_intervals=final_pred_velocity_intervals,
+                est_pitches=final_pred_velocity_pitches,
+                onset_tolerance=0.05,
+                pitch_tolerance=0.0,
+                offset_ratio=None
+            )
+            
+            # Step 2: 매칭된 노트들 중에서 Velocity 차이가 허용범위 이내인 것만 TP로 인정
+            velocity_tp = 0
+            
+            # Velocity 허용 오차: 127 스케일의 10% = 12.7
+            VEL_TOLERANCE = 12.7 
+            
+            for ref_idx, est_idx in matches:
+                ref_vel = final_target_velocities[ref_idx]
+                est_vel = final_pred_velocities[est_idx]
+                
+                if abs(ref_vel - est_vel) <= VEL_TOLERANCE:
+                    velocity_tp += 1
+            
+            # Step 3: Precision, Recall, F1 계산
+            n_ref = len(final_target_velocities)
+            n_est = len(final_pred_velocities)
+            
+            mir_velocity_precision = velocity_tp / n_est if n_est > 0 else 0.0
+            mir_velocity_recall = velocity_tp / n_ref if n_ref > 0 else 0.0
+            
+            if (mir_velocity_precision + mir_velocity_recall) > 0:
+                mir_velocity_f1 = 2 * mir_velocity_precision * mir_velocity_recall / (mir_velocity_precision + mir_velocity_recall)
+            else:
+                mir_velocity_f1 = 0.0
+                
+        except Exception as e:
+            print(f"❌ Error in manual velocity evaluation: {e}")
             mir_velocity_f1 = mir_velocity_precision = mir_velocity_recall = 0.0
         
         # Calculate final metrics
@@ -327,10 +383,10 @@ class ModelEvaluator:
     def calculate_metrics(self, losses, frame_preds, frame_targets, per_drum_metrics, velocity_errors,
                          mir_onset_f1, mir_onset_precision, mir_onset_recall,
                          mir_velocity_f1, mir_velocity_precision, mir_velocity_recall):
-        """Calculate and format evaluation metrics with mir_eval results"""
+        """Calculate and format evaluation metrics"""
         results = {}
         
-        # Loss metrics
+        # Loss
         results['loss'] = {
             'mean': float(np.mean(losses)),
             'std': float(np.std(losses)),
@@ -338,15 +394,13 @@ class ModelEvaluator:
             'max': float(np.max(losses))
         }
         
-        # Frame-level metrics
+        # Frame-level
         frame_preds_all = np.concatenate(frame_preds)
         frame_targets_all = np.concatenate(frame_targets)
-        
         frame_precision, frame_recall, frame_f1, _ = precision_recall_fscore_support(
             frame_targets_all, frame_preds_all, average='binary', zero_division=0
         )
         frame_accuracy = accuracy_score(frame_targets_all, frame_preds_all)
-        
         results['frame_level'] = {
             'precision': float(frame_precision),
             'recall': float(frame_recall),
@@ -354,17 +408,16 @@ class ModelEvaluator:
             'accuracy': float(frame_accuracy)
         }
         
-        # Note-level metrics (기존 30ms + mir_eval 50ms 둘 다 포함)
+        # Note-level
         overall_tp = sum(metrics['tp'] for metrics in per_drum_metrics.values())
         overall_fp = sum(metrics['fp'] for metrics in per_drum_metrics.values())
         overall_fn = sum(metrics['fn'] for metrics in per_drum_metrics.values())
-        
         overall_precision = overall_tp / (overall_tp + overall_fp) if (overall_tp + overall_fp) > 0 else 0
         overall_recall = overall_tp / (overall_tp + overall_fn) if (overall_tp + overall_fn) > 0 else 0
         overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0
         
         results['note_level'] = {
-            'overall_30ms': {  # 기존 30ms tolerance
+            'overall_30ms': { 
                 'precision': float(overall_precision),
                 'recall': float(overall_recall),
                 'f1_score': float(overall_f1),
@@ -373,17 +426,17 @@ class ModelEvaluator:
                 'fn': int(overall_fn),
                 'method': 'custom_30ms'
             },
-            'mir_eval_onset': {  # [논문 표준] mir_eval onset (50ms)
+            'mir_eval_onset': { 
                 'precision': float(mir_onset_precision),
                 'recall': float(mir_onset_recall),
                 'f1_score': float(mir_onset_f1),
                 'method': 'mir_eval_50ms_onset_only'
             },
-            'mir_eval_velocity': {  # [논문 표준] mir_eval onset+velocity
+            'mir_eval_velocity': { 
                 'precision': float(mir_velocity_precision),
                 'recall': float(mir_velocity_recall),
                 'f1_score': float(mir_velocity_f1),
-                'method': 'mir_eval_50ms_onset_velocity'
+                'method': 'mir_eval_50ms_onset_velocity_manual'
             }
         }
         
@@ -394,16 +447,12 @@ class ModelEvaluator:
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
             per_drum_results[DRUM_NAMES[drum_idx]] = {
                 'precision': float(precision),
                 'recall': float(recall),
                 'f1_score': float(f1),
-                'tp': int(tp),
-                'fp': int(fp),
-                'fn': int(fn)
+                'tp': int(tp), 'fp': int(fp), 'fn': int(fn)
             }
-        
         results['per_drum'] = per_drum_results
         
         # Velocity metrics
@@ -417,13 +466,11 @@ class ModelEvaluator:
         else:
             results['velocity'] = {'mae': 0.0, 'mse': 0.0, 'std': 0.0, 'samples': 0}
         
-        # Training info
         results['model_info'] = {
             'checkpoint_epoch': self.epoch,
             'training_loss': self.train_loss,
             'eval_steps': self.args.eval_steps
         }
-        
         return results
 
     def print_results(self, results):
@@ -432,98 +479,62 @@ class ModelEvaluator:
         print(f"🎯 EVALUATION RESULTS - Epoch {results['model_info']['checkpoint_epoch']}")
         print("="*60)
         
-        # Loss
         loss_info = results['loss']
         print(f"\n📊 Loss Metrics:")
         print(f"   Mean Loss: {loss_info['mean']:.4f} (±{loss_info['std']:.4f})")
-        print(f"   Range: {loss_info['min']:.4f} - {loss_info['max']:.4f}")
         
-        # Frame-level
         frame = results['frame_level']
         print(f"\n🎵 Frame-Level Performance:")
-        print(f"   Precision: {frame['precision']:.3f}")
-        print(f"   Recall:    {frame['recall']:.3f}")
-        print(f"   F1-Score:  {frame['f1_score']:.3f}")
-        print(f"   Accuracy:  {frame['accuracy']:.3f}")
+        print(f"   F1-Score:  {frame['f1_score']:.3f} (Acc: {frame['accuracy']:.3f})")
         
-        # Note-level (기존 + mir_eval)
         note_30ms = results['note_level']['overall_30ms']
         note_onset = results['note_level']['mir_eval_onset']
         note_velocity = results['note_level']['mir_eval_velocity']
         
         print(f"\n🎼 Note-Level Performance:")
-        print(f"   [기존 30ms] F1: {note_30ms['f1_score']:.3f}, P: {note_30ms['precision']:.3f}, R: {note_30ms['recall']:.3f}")
-        print(f"   [논문 50ms onset] F1: {note_onset['f1_score']:.3f}, P: {note_onset['precision']:.3f}, R: {note_onset['recall']:.3f}")
-        print(f"   [논문 50ms onset+velocity] F1: {note_velocity['f1_score']:.3f}, P: {note_velocity['precision']:.3f}, R: {note_velocity['recall']:.3f}")
-        print(f"   Events (30ms): {note_30ms['tp']} TP, {note_30ms['fp']} FP, {note_30ms['fn']} FN")
+        print(f"   [기존 30ms] F1: {note_30ms['f1_score']:.3f}")
+        print(f"   [논문 50ms Onset] F1: {note_onset['f1_score']:.3f}")
+        print(f"   [논문 50ms Onset+Vel] F1: {note_velocity['f1_score']:.3f}")
         
-        # Velocity
         vel = results['velocity']
         if vel['samples'] > 0:
-            print(f"\n🔊 Velocity Estimation:")
+            print(f"\n🔊 Velocity Estimation (Scale: 1-127):")
             print(f"   MAE: {vel['mae']:.3f}")
             print(f"   RMSE: {np.sqrt(vel['mse']):.3f}")
-            print(f"   Active frames: {vel['samples']}")
         
-        # Per-drum breakdown
-        print(f"\n🥁 Per-Drum Performance (F1-Scores):")
+        print(f"\n🥁 Per-Drum F1-Scores:")
         for drum_name, metrics in results['per_drum'].items():
-            print(f"   {drum_name:6}: {metrics['f1_score']:.3f} ({metrics['tp']:2}TP/{metrics['fp']:2}FP/{metrics['fn']:2}FN)")
-        
-        # Performance assessment (논문 표준 mir_eval onset+velocity 기준)
-        paper_f1 = results['note_level']['mir_eval_velocity']['f1_score']  # onset+velocity F1
-        print(f"\n🎯 Performance Assessment (논문 표준):")
-        print(f"   현재 F1: {paper_f1:.3f} | 논문 EGMD F1: 0.826 (reference)")
-        if paper_f1 >= 0.8:
-            print("   🔥 EXCELLENT - Near paper-level performance!")
-        elif paper_f1 >= 0.6:
-            print("   ✅ GOOD - Strong drum transcription capability")
-        elif paper_f1 >= 0.4:
-            print("   📈 MODERATE - Learning in progress, needs more training")
-        elif paper_f1 >= 0.2:
-            print("   ⚠️  BASIC - Early learning stage")
-        else:
-            print("   🔄 EARLY - Model still learning fundamentals")
+            print(f"   {drum_name:6}: {metrics['f1_score']:.3f}")
+            
+        paper_f1 = results['note_level']['mir_eval_velocity']['f1_score']
+        print(f"\n🎯 Final Assessment (Onset+Vel): F1 {paper_f1:.3f}")
 
     def save_results(self, results):
-        """Save results to JSON file"""
         if self.args.output_dir:
             os.makedirs(self.args.output_dir, exist_ok=True)
-            
-            # Create filename with epoch info
             ckpt_name = Path(self.args.ckpt_path).stem
             output_file = os.path.join(self.args.output_dir, f"eval_{ckpt_name}.json")
-            
             with open(output_file, 'w') as f:
                 json.dump(results, f, indent=2)
-            
             print(f"\n💾 Results saved to: {output_file}")
 
     def run(self):
-        """Run complete evaluation"""
         results = self.evaluate_model()
         self.print_results(results)
-        
         if self.args.output_dir:
             self.save_results(results)
-        
         return results
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Evaluate N2N Flow Matching Model')
-    parser.add_argument('--ckpt_path', type=str, required=True, 
-                       help='Path to model checkpoint')
-    parser.add_argument('--output_dir', type=str, default='eval_results',
-                       help='Directory to save evaluation results')
-    parser.add_argument('--eval_steps', type=int, default=10,
-                       help='Number of sampling steps for inference')
-    parser.add_argument('--quick', action='store_true',
-                       help='Quick evaluation mode (200 samples, 5 steps, ~5min)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ckpt_path', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='eval_results')
+    parser.add_argument('--eval_steps', type=int, default=10)
+    parser.add_argument('--quick', action='store_true')
     
     args = parser.parse_args()
-    
     if args.quick:
-        print("⚡ Quick evaluation mode enabled (200 samples, 5 steps)")
+        print("⚡ Quick evaluation mode enabled")
     
     evaluator = ModelEvaluator(args)
     evaluator.run()
